@@ -1,19 +1,27 @@
 import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ArrowLeft } from 'lucide-react';
+import { ArrowLeft, Users } from 'lucide-react';
 import { MapBackground } from '../components/MapBackground';
-import { useFirebaseRide } from '../hooks/useFirebaseRide';
 import { useUserProfile } from '../hooks/useUserProfile';
-import { calculatePriceWithStops, getCarTypePrice } from '../utils/priceCalculation';
 import { useRideContext } from '../contexts/RideContext';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { database, auth, db } from '../config/firebase';
 import { ref, push, set } from 'firebase/database';
-import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
+import { collection, addDoc, serverTimestamp, doc, setDoc } from 'firebase/firestore';
 
 interface UserLocation {
   lat: number | null;
   lng: number | null;
+}
+
+interface RideData {
+  pricingId: string;
+  name: string;
+  estimatedPrice: number;
+  originalPrice: number;
+  eta: string;
+  vehicleCategory: string;
+  seats: number;
 }
 
 interface ConfirmOrderProps {
@@ -42,7 +50,6 @@ export const ConfirmOrder: React.FC<ConfirmOrderProps> = ({
   const [isLoading, setIsLoading] = useState(false);
   const [userLocation, setUserLocation] = useState<UserLocation>({ lat: null, lng: null });
   const { profile } = useUserProfile();
-  const { createRide } = useFirebaseRide();
   const { isRideActive } = useRideContext();
 
   // Get user's GPS location on component mount
@@ -57,7 +64,6 @@ export const ConfirmOrder: React.FC<ConfirmOrderProps> = ({
         },
         (error) => {
           console.error('Error getting user location:', error);
-          // Keep null values if GPS fails
         },
         { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
       );
@@ -66,27 +72,26 @@ export const ConfirmOrder: React.FC<ConfirmOrderProps> = ({
 
   const {
     orderType = 'ride',
-    type = '', // Category type: 'food', 'clothes', 'hardware'
+    type = '',
     orderData = {},
     serviceType,
     vehicle,
     extraSelection,
     pickupAddress,
-    destinationAddress
+    destinationAddress,
+    rideData,
+    pickupCoords,
+    destinationCoords
   } = location.state || {};
 
   const isDelivery = orderType === 'delivery';
-  const isFood = orderType === 'food'; // Legacy support
+  const isFood = orderType === 'food';
+  const isRide = orderType === 'ride' && rideData;
 
   const isDeliveryOrFood = isDelivery || isFood;
-  const finalDestination = isDeliveryOrFood ? orderData.destinationAddress : destination;
-  const finalPickup = isDeliveryOrFood ? (orderData.storeAddress || orderData.pickupAddress) : pickup;
+  const finalDestination = isRide ? destinationAddress : (isDeliveryOrFood ? orderData.destinationAddress : destination);
+  const finalPickup = isRide ? pickupAddress : (isDeliveryOrFood ? (orderData.storeAddress || orderData.pickupAddress) : pickup);
   const finalStops = isDeliveryOrFood ? (orderData.stops || []) : stops;
-  const finalCarType = isDeliveryOrFood ? orderData.deliveryMode?.label : carType;
-  const finalPrice = isDeliveryOrFood ? orderData.totalPrice : price;
-
-  const priceCalculation = !isDeliveryOrFood ? calculatePriceWithStops(pickup, destination, stops) : null;
-  const displayPrice = isDeliveryOrFood ? finalPrice : (priceCalculation ? getCarTypePrice(priceCalculation.totalPrice, carType) : finalPrice);
 
   const isService = serviceType && serviceType !== 'ride';
 
@@ -158,9 +163,7 @@ export const ConfirmOrder: React.FC<ConfirmOrderProps> = ({
 
   const createDeliveryOrder = async () => {
     const currentUser = auth.currentUser;
-    // Guest checkout is allowed per Firestore rules (allow create: if true)
 
-    // Clean items array - only include required fields
     const cleanItems = (orderData.items || []).map((item: any) => ({
       id: item.id || '',
       name: item.name || '',
@@ -169,57 +172,36 @@ export const ConfirmOrder: React.FC<ConfirmOrderProps> = ({
       category: type || item.category || 'food',
     }));
 
-    // Build the exact Firestore document structure
     const deliveryOrder = {
-      // Order type
-      type: type || 'food', // "food" | "clothes" | "hardware"
-
-      // Store info
+      type: type || 'food',
       storeId: orderData.storeId || '',
       storeName: orderData.storeName || '',
-      storeAddress: orderData.storeAddress || '', // Real store address from Firestore
+      storeAddress: orderData.storeAddress || '',
       storeLocation: orderData.storeLocation || { lat: null, lng: null },
-
-      // User info
       userId: currentUser?.uid || 'guest',
       userName: currentUser?.displayName || profile?.name || 'Guest User',
       userEmail: currentUser?.email || profile?.email || '',
-
-      // User location from GPS (NOT extracted from address string)
       userLocation: {
         lat: userLocation.lat,
         lng: userLocation.lng,
       },
       destinationAddress: orderData.destinationAddress || '',
-
-      // Items
       items: cleanItems,
-
-      // Pricing
       subtotal: orderData.subtotal || orderData.foodSubtotal || 0,
       deliveryFee: orderData.deliveryFee || 0,
       total: orderData.totalPrice || 0,
-
-      // Delivery mode
       deliveryMode: orderData.deliveryMode ? {
         id: orderData.deliveryMode.id || '',
         fee: orderData.deliveryMode.deliveryFee || orderData.deliveryFee || 0,
         estimatedTime: parseInt(orderData.deliveryMode.time) || 20,
       } : null,
-
-      // Status
       status: 'pending',
       driverId: null,
       driverStatus: 'waiting',
-
-      // Prep time
       prepTime: 15,
-
-      // Timestamp
       createdAt: serverTimestamp(),
     };
 
-    // Save to Firestore 'orders' collection
     const ordersRef = collection(db, 'orders');
     const docRef = await addDoc(ordersRef, deliveryOrder);
     const orderId = docRef.id;
@@ -227,7 +209,6 @@ export const ConfirmOrder: React.FC<ConfirmOrderProps> = ({
     localStorage.setItem('currentDeliveryOrderId', orderId);
     localStorage.setItem('currentOrderType', 'delivery');
 
-    // Navigate to OrderTrackingPage for delivery orders (food, clothes, hardware)
     navigate('/order-tracking', {
       state: {
         orderId: orderId,
@@ -239,6 +220,71 @@ export const ConfirmOrder: React.FC<ConfirmOrderProps> = ({
     });
 
     return orderId;
+  };
+
+  /**
+   * Create ride request in Firestore (NOT Realtime Database)
+   * Creates BOTH rideRequests and rides documents
+   */
+  const createRideInFirestore = async () => {
+    const currentUser = auth.currentUser;
+    const userId = currentUser?.uid || profile?.id || 'guest';
+    const userName = currentUser?.displayName || profile?.name || 'Guest User';
+    const userEmail = currentUser?.email || profile?.email || '';
+
+    // Common data for both documents
+    const commonData = {
+      userId,
+      userName,
+      userEmail,
+      pickupLocation: {
+        address: finalPickup,
+        latitude: pickupCoords?.lat || userLocation.lat,
+        longitude: pickupCoords?.lng || userLocation.lng
+      },
+      destinationLocation: {
+        address: finalDestination,
+        latitude: destinationCoords?.lat || null,
+        longitude: destinationCoords?.lng || null
+      },
+      stops: finalStops || [],
+      pricingId: rideData.pricingId,
+      service: 'ride',
+      vehicleCategory: rideData.vehicleCategory,
+      seats: rideData.seats,
+      estimatedPrice: rideData.estimatedPrice,
+      originalPrice: rideData.originalPrice,
+      rideName: rideData.name,
+      eta: rideData.eta
+    };
+
+    // Create rideRequests document (for driver matching by backend)
+    const rideRequestsRef = collection(db, 'rideRequests');
+    const rideRequestDoc = await addDoc(rideRequestsRef, {
+      ...commonData,
+      status: 'pending',
+      createdAt: serverTimestamp()
+    });
+    const rideRequestId = rideRequestDoc.id;
+
+    // Create rides document (for client tracking)
+    const ridesRef = collection(db, 'rides');
+    const rideDoc = await addDoc(ridesRef, {
+      ...commonData,
+      rideRequestId,
+      status: 'pending',
+      driverId: null,
+      driverInfo: null,
+      createdAt: serverTimestamp()
+    });
+    const rideId = rideDoc.id;
+
+    // Update rideRequest with the rideId for cross-reference
+    await setDoc(doc(db, 'rideRequests', rideRequestId), {
+      rideId
+    }, { merge: true });
+
+    return rideId;
   };
 
   const handleConfirmOrder = async () => {
@@ -255,10 +301,9 @@ export const ConfirmOrder: React.FC<ConfirmOrderProps> = ({
       if (isService) {
         await confirmServiceRequest();
       } else if (isDelivery) {
-        // Use the new createDeliveryOrder for all delivery types (food, clothes, hardware)
         await createDeliveryOrder();
       } else if (isFood) {
-        // Legacy food order support - redirect to new delivery flow
+        // Legacy food order support
         const foodOrder = {
           type: 'food',
           deliveryMode: orderData.deliveryMode,
@@ -291,19 +336,12 @@ export const ConfirmOrder: React.FC<ConfirmOrderProps> = ({
             orderData: foodOrder
           }
         });
-      } else {
-        const rideRequest = {
-          pickup: finalPickup,
-          destination: finalDestination,
-          stops: finalStops || [],
-          carType: finalCarType,
-          price: displayPrice,
-          status: 'pending' as const,
-          userId: profile?.id || 'user123',
-          userName: profile?.name || 'Unknown User'
-        };
+      } else if (isRide && rideData) {
+        // NEW: Create ride request in Firestore
+        const rideId = await createRideInFirestore();
 
-        const rideId = await createRide(rideRequest);
+        localStorage.setItem('currentRideId', rideId);
+        localStorage.setItem('currentOrderType', 'ride');
 
         onRideCreated(rideId);
 
@@ -311,9 +349,24 @@ export const ConfirmOrder: React.FC<ConfirmOrderProps> = ({
           state: {
             orderType: 'ride',
             requestId: rideId,
-            orderData: rideRequest
+            useFirestore: true, // Flag to tell WaitingForDriver to use Firestore
+            orderData: {
+              pickup: finalPickup,
+              destination: finalDestination,
+              stops: finalStops,
+              pricingId: rideData.pricingId,
+              rideName: rideData.name,
+              estimatedPrice: rideData.estimatedPrice,
+              vehicleCategory: rideData.vehicleCategory,
+              seats: rideData.seats,
+              eta: rideData.eta,
+              status: 'pending'
+            }
           }
         });
+      } else {
+        // Fallback for old flow without rideData
+        throw new Error('Ride data is missing. Please select a ride first.');
       }
     } catch (error) {
       console.error('Failed to create order:', error);
@@ -354,7 +407,9 @@ export const ConfirmOrder: React.FC<ConfirmOrderProps> = ({
       >
         <div className="bg-green-600 text-white px-6 py-3 rounded-full shadow-lg">
           <div className="text-center">
-            <div className="text-2xl font-bold">2</div>
+            <div className="text-2xl font-bold">
+              {isRide ? rideData?.eta?.replace(' min', '') || '2' : '2'}
+            </div>
             <div className="text-sm">min</div>
           </div>
         </div>
@@ -525,31 +580,87 @@ export const ConfirmOrder: React.FC<ConfirmOrderProps> = ({
                 </div>
               </div>
             </>
+          ) : isRide && rideData ? (
+            // New ride confirmation display
+            <>
+              <div className="text-center">
+                <h2 className="text-2xl font-bold text-gray-900 mb-2">{rideData.name}</h2>
+                <p className="text-gray-600">{rideData.eta} away</p>
+              </div>
+
+              <div className="bg-gray-50 rounded-xl p-4">
+                <h3 className="font-semibold text-gray-900 mb-3">Trip Details</h3>
+                <div className="space-y-3 text-sm">
+                  <div className="flex items-start gap-3">
+                    <div className="w-3 h-3 bg-green-500 rounded-full mt-1 flex-shrink-0"></div>
+                    <div>
+                      <span className="text-gray-500 text-xs">Pickup</span>
+                      <p className="text-gray-900 font-medium">{finalPickup}</p>
+                    </div>
+                  </div>
+                  {finalStops.length > 0 && finalStops.map((stop: string, idx: number) => (
+                    <div key={idx} className="flex items-start gap-3 ml-1">
+                      <div className="w-2 h-2 bg-blue-500 rounded-full mt-1 flex-shrink-0"></div>
+                      <div>
+                        <span className="text-gray-500 text-xs">Stop {idx + 1}</span>
+                        <p className="text-gray-900 font-medium">{stop}</p>
+                      </div>
+                    </div>
+                  ))}
+                  <div className="flex items-start gap-3">
+                    <div className="w-3 h-3 bg-blue-600 rounded-full mt-1 flex-shrink-0"></div>
+                    <div>
+                      <span className="text-gray-500 text-xs">Destination</span>
+                      <p className="text-gray-900 font-medium">{finalDestination}</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-gray-50 rounded-xl p-4">
+                <h3 className="font-semibold text-gray-900 mb-3">Ride Details</h3>
+                <div className="space-y-2 text-sm">
+                  <div className="flex justify-between">
+                    <span className="text-gray-600">Ride Type</span>
+                    <span className="text-gray-900 font-medium">{rideData.name}</span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-gray-600">Passengers</span>
+                    <div className="flex items-center gap-1">
+                      <Users size={14} className="text-gray-500" />
+                      <span className="text-gray-900 font-medium">{rideData.seats}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-gray-50 rounded-xl p-4 space-y-2">
+                <h3 className="font-semibold text-gray-900 mb-3">Payment Summary</h3>
+                {rideData.originalPrice !== rideData.estimatedPrice && (
+                  <div className="flex justify-between text-sm">
+                    <span className="text-gray-600">Original fare</span>
+                    <span className="font-medium text-gray-500 line-through">R {rideData.originalPrice}</span>
+                  </div>
+                )}
+                <div className="flex justify-between text-sm">
+                  <span className="text-gray-600">Discounted fare</span>
+                  <span className="font-medium text-green-600">30% off</span>
+                </div>
+                <div className="flex justify-between pt-2 border-t border-gray-200">
+                  <span className="font-semibold text-gray-900">Total</span>
+                  <span className="text-lg font-bold text-gray-900">R {rideData.estimatedPrice}</span>
+                </div>
+              </div>
+            </>
           ) : (
+            // Fallback display
             <>
               <div className="text-center">
                 <h2 className="text-2xl font-bold text-gray-900">{finalDestination}</h2>
-                {finalStops.length > 0 && (
-                  <div className="mt-2">
-                    <p className="text-sm text-gray-600">via {finalStops.length} stop{finalStops.length > 1 ? 's' : ''}</p>
-                    <div className="text-xs text-gray-500 mt-1">
-                      {finalStops.map((stop, index) => (
-                        <span key={index}>
-                          {stop}{index < finalStops.length - 1 ? ' → ' : ''}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                )}
                 <div className="flex items-center justify-center space-x-4 mt-4">
-                  <span className="text-lg font-medium text-gray-700">{finalCarType}</span>
-                  <span className="text-2xl font-bold text-gray-900">R {displayPrice}</span>
+                  <span className="text-lg font-medium text-gray-700">{carType}</span>
+                  <span className="text-2xl font-bold text-gray-900">R {price}</span>
                 </div>
-                {priceCalculation && (
-                  <div className="text-sm text-gray-500 mt-2">
-                    {priceCalculation.totalDistance}km total distance
-                  </div>
-                )}
               </div>
             </>
           )}

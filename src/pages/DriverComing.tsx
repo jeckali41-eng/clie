@@ -6,15 +6,15 @@ import { ScrollableSection } from '../components/ScrollableSection';
 import { MapBackground } from '../components/MapBackground';
 import { MessagePanel } from '../components/MessagePanel';
 import { RatingModal } from '../components/RatingModal';
-import { calculatePriceWithStops, getCarTypePrice } from '../utils/priceCalculation';
 import { firebaseService } from '../services/firebaseService';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useUserProfile } from '../hooks/useUserProfile';
 import { useFirebaseRide } from '../hooks/useFirebaseRide';
 import { useMessageContext } from '../contexts/MessageContext';
-import { database } from '../config/firebase';
-import { ref, onValue, off, update, serverTimestamp } from 'firebase/database';
-import { listenToOrder, listenToDriverLocation, calculateETA } from '../services/trackingService';
+import { database, db } from '../config/firebase';
+import { ref, onValue, off, update } from 'firebase/database';
+import { doc, onSnapshot, updateDoc, serverTimestamp } from 'firebase/firestore';
+import { listenToDriverLocation, calculateETA } from '../services/trackingService';
 
 interface DriverComingProps {
   destination: string;
@@ -55,9 +55,16 @@ export const DriverComing: React.FC<DriverComingProps> = ({
   const { currentRide } = useFirebaseRide(currentRideId);
   const { unreadMessageCount, markMessagesAsRead } = useMessageContext();
 
-  const { orderType = 'ride', requestId, orderData = {} } = location.state || {};
+  const { 
+    orderType = 'ride', 
+    requestId, 
+    orderData = {},
+    useFirestore = false 
+  } = location.state || {};
+  
   const isFood = orderType === 'food';
   const isService = orderType === 'service';
+  const isRide = orderType === 'ride';
   const orderId = requestId || currentRideId;
 
   const [driverInfo, setDriverInfo] = useState<DriverInfo | null>(null);
@@ -70,24 +77,55 @@ export const DriverComing: React.FC<DriverComingProps> = ({
   const [showCancelConfirmation, setShowCancelConfirmation] = useState(false);
   const [foodOrderDetails, setFoodOrderDetails] = useState<any>(null);
   const [serviceRequestDetails, setServiceRequestDetails] = useState<any>(null);
+  const [firestoreRideData, setFirestoreRideData] = useState<any>(null);
   const gpsListenerRef = useRef<(() => void) | null>(null);
   const orderListenerRef = useRef<(() => void) | null>(null);
 
-  const finalDestination = isService ? orderData.destinationAddress : (isFood ? orderData.destinationAddress : destination);
-  const finalPickup = isService ? orderData.pickupAddress : (isFood ? orderData.pickupAddress : pickup);
-  const finalStops = isService ? (orderData.stops || []) : (isFood ? (orderData.stops || []) : stops);
-  const finalCarType = isService ? orderData.vehicleClass : (isFood ? orderData.deliveryMode?.label : carType);
-  const finalPrice = isService ? orderData.pricing?.basePrice : (isFood ? orderData.totalPrice : price);
-
-  const priceCalculation = !isFood ? calculatePriceWithStops(pickup, destination, stops) : null;
-  const displayPrice = isFood ? finalPrice : (priceCalculation ? getCarTypePrice(priceCalculation.totalPrice, carType) : finalPrice);
+  const finalDestination = isService 
+    ? orderData.destinationAddress 
+    : isFood 
+      ? orderData.destinationAddress 
+      : (orderData.destination || orderData.destinationLocation?.address || destination);
+  
+  const finalPickup = isService 
+    ? orderData.pickupAddress 
+    : isFood 
+      ? orderData.pickupAddress 
+      : (orderData.pickup || orderData.pickupLocation?.address || pickup);
+  
+  const finalStops = isService 
+    ? (orderData.stops || []) 
+    : isFood 
+      ? (orderData.stops || []) 
+      : (orderData.stops || stops);
+  
+  const finalCarType = isService 
+    ? orderData.vehicleClass 
+    : isFood 
+      ? orderData.deliveryMode?.label 
+      : (orderData.rideName || carType);
+  
+  const finalPrice = isService 
+    ? orderData.pricing?.basePrice 
+    : isFood 
+      ? orderData.totalPrice 
+      : (orderData.estimatedPrice || price);
 
   // Fetch driver info
   useEffect(() => {
     const fetchDriverInfo = async () => {
-      if (currentRide?.driverId) {
+      // First check if driver info is in orderData (from Firestore)
+      if (orderData?.driverInfo) {
+        setDriverInfo(orderData.driverInfo);
+        return;
+      }
+      
+      // Check current ride for driver ID
+      const driverId = firestoreRideData?.driverId || currentRide?.driverId || orderData?.driverId;
+      
+      if (driverId) {
         try {
-          const fetchedDriver = await firebaseService.getDriverInfo(currentRide.driverId);
+          const fetchedDriver = await firebaseService.getDriverInfo(driverId);
           if (fetchedDriver) {
             setDriverInfo(fetchedDriver);
             return;
@@ -97,121 +135,186 @@ export const DriverComing: React.FC<DriverComingProps> = ({
         }
       }
 
+      // Fallback driver info
       const fallbackDriverInfo: DriverInfo = {
         id: 'driver123',
         name: 'Allen',
         rating: 4.8,
         plateNumber: 'KW14CKGP',
-        carModel: 'Silver • Honda Amaze',
+        carModel: 'Silver - Honda Amaze',
         eta: '',
         photo: '👨🏽‍💼',
         location: { latitude: -26.2041, longitude: 28.0473 }
       };
       setDriverInfo(fallbackDriverInfo);
     };
+    
     fetchDriverInfo();
-  }, [currentRide]);
+  }, [currentRide, orderData, firestoreRideData]);
 
-  // Live order tracking with GPS-based ETA - Single GPS listener pattern
+  // Listen to ride status changes - Firestore or Realtime DB
   useEffect(() => {
     if (!orderId) return;
 
-    // Determine collection name based on order type
-    const collectionName = isService ? 'serviceRequests' : (isFood ? 'foodOrders' : 'rides');
+    // For ride orders using Firestore
+    if (isRide && useFirestore) {
+      const rideDocRef = doc(db, 'rides', orderId);
+      
+      const unsubscribe = onSnapshot(rideDocRef, (snapshot) => {
+        if (!snapshot.exists()) return;
+        
+        const data = snapshot.data();
+        setFirestoreRideData(data);
+        const newStatus = data.status;
+        setRideStatus(newStatus);
 
-    // Create order listener
-    const unsubscribeOrder = listenToOrder(orderId, collectionName, (order) => {
-      if (!order) return;
-
-      const newStatus = order.status;
-      setRideStatus(newStatus);
-
-      // Handle food order specific data
-      if (isFood) {
-        setFoodOrderDetails(order);
-        if (order.driverId && !driverInfo) {
-          firebaseService.getDriverInfo(order.driverId).then((driver) => {
+        // Update driver info if available
+        if (data.driverInfo && !driverInfo) {
+          setDriverInfo(data.driverInfo);
+        } else if (data.driverId && !driverInfo) {
+          firebaseService.getDriverInfo(data.driverId).then((driver) => {
             if (driver) setDriverInfo(driver);
           });
         }
-      }
 
-      // Handle service request specific data
-      if (isService) {
-        setServiceRequestDetails(order);
-        if (order.driverId && !driverInfo) {
-          firebaseService.getDriverInfo(order.driverId).then((driver) => {
-            if (driver) setDriverInfo(driver);
+        // Show arrival alert
+        if (newStatus === 'arrived' && !hasShownArrivalAlert) {
+          setShowArrivalAlert(true);
+          setHasShownArrivalAlert(true);
+          setStatusText('Your driver has arrived');
+          setTimeout(() => setShowArrivalAlert(false), 5000);
+        }
+
+        // Handle trip started
+        if (newStatus === 'started') {
+          setStatusText('On trip');
+        }
+
+        // Handle completion
+        if (newStatus === 'completed') {
+          if (gpsListenerRef.current) {
+            gpsListenerRef.current();
+            gpsListenerRef.current = null;
+          }
+          setStatusText("You've arrived at your destination");
+          setTimeout(() => setIsRatingModalOpen(true), 2000);
+          return;
+        }
+
+        // Start GPS listener when driver is assigned
+        if (newStatus === 'accepted' && data.driverId && !gpsListenerRef.current) {
+          gpsListenerRef.current = listenToDriverLocation(data.driverId, (driverLoc) => {
+            const currentStatus = rideStatus;
+
+            if (currentStatus === 'accepted') {
+              const pickupCoords = data.pickupLocation || { latitude: -26.2041, longitude: 28.0473 };
+              const etaMinutes = calculateETA(driverLoc, pickupCoords);
+              setStatusText(`Arriving in ${etaMinutes} min${etaMinutes !== 1 ? 's' : ''}`);
+            } else if (currentStatus === 'started') {
+              const destinationCoords = data.destinationLocation || { latitude: -26.195, longitude: 28.04 };
+              const etaMinutes = calculateETA(driverLoc, destinationCoords);
+              setStatusText(`On trip - ETA ${etaMinutes} min${etaMinutes !== 1 ? 's' : ''}`);
+            }
           });
         }
-      }
+      });
 
-      // Show arrival alert
-      if (newStatus === 'arrived' && !hasShownArrivalAlert) {
-        setShowArrivalAlert(true);
-        setHasShownArrivalAlert(true);
-        setTimeout(() => setShowArrivalAlert(false), 5000);
-      }
-
-      // Handle completion
-      if (newStatus === 'completed' || newStatus === 'delivered') {
+      orderListenerRef.current = unsubscribe;
+      
+      return () => {
+        if (orderListenerRef.current) {
+          orderListenerRef.current();
+          orderListenerRef.current = null;
+        }
         if (gpsListenerRef.current) {
           gpsListenerRef.current();
           gpsListenerRef.current = null;
         }
-        setStatusText("You've arrived at your destination");
-        setTimeout(() => setIsRatingModalOpen(true), 2000);
-        return;
-      }
+      };
+    } else {
+      // Use Realtime Database for other order types
+      const collectionName = isService ? 'serviceRequests' : (isFood ? 'foodOrders' : 'rides');
+      const orderRef = ref(database, `${collectionName}/${orderId}`);
 
-      // Create GPS listener ONCE when driver is assigned (status = accepted)
-      if (newStatus === 'accepted' && order.driverId && !gpsListenerRef.current) {
-        gpsListenerRef.current = listenToDriverLocation(order.driverId, (driverLoc) => {
-          // Dynamically choose target based on current status
-          const currentStatus = rideStatus;
+      const unsubscribe = onValue(orderRef, (snapshot) => {
+        const data = snapshot.val();
+        if (!data) return;
 
-          if (currentStatus === 'accepted' || currentStatus === 'arrived') {
-            // Target = pickup location
-            const pickupCoords = order.pickupLocation || { latitude: -26.2041, longitude: 28.0473 };
-            const etaMinutes = calculateETA(driverLoc, pickupCoords);
+        const newStatus = data.status;
+        setRideStatus(newStatus);
 
-            if (currentStatus === 'accepted') {
-              setStatusText(`Arriving in ${etaMinutes} min${etaMinutes !== 1 ? 's' : ''}`);
-            }
-          } else if (currentStatus === 'started') {
-            // Target = destination location
-            const destinationCoords = order.destinationLocation || { latitude: -26.195, longitude: 28.04 };
-            const etaMinutes = calculateETA(driverLoc, destinationCoords);
-            setStatusText(`On trip — ETA ${etaMinutes} min${etaMinutes !== 1 ? 's' : ''}`);
+        if (isFood) {
+          setFoodOrderDetails(data);
+          if (data.driverId && !driverInfo) {
+            firebaseService.getDriverInfo(data.driverId).then((driver) => {
+              if (driver) setDriverInfo(driver);
+            });
           }
-        });
-      }
+        }
 
-      // Update status text for arrived (freeze ETA)
-      if (newStatus === 'arrived') {
-        setStatusText('Your driver has arrived');
-      }
+        if (isService) {
+          setServiceRequestDetails(data);
+          if (data.driverId && !driverInfo) {
+            firebaseService.getDriverInfo(data.driverId).then((driver) => {
+              if (driver) setDriverInfo(driver);
+            });
+          }
+        }
 
-      // Status text for started is handled by GPS listener above
-    });
+        // Show arrival alert
+        if (newStatus === 'arrived' && !hasShownArrivalAlert) {
+          setShowArrivalAlert(true);
+          setHasShownArrivalAlert(true);
+          setStatusText('Your driver has arrived');
+          setTimeout(() => setShowArrivalAlert(false), 5000);
+        }
 
-    // Store order listener cleanup
-    orderListenerRef.current = unsubscribeOrder;
+        // Handle completion
+        if (newStatus === 'completed' || newStatus === 'delivered') {
+          if (gpsListenerRef.current) {
+            gpsListenerRef.current();
+            gpsListenerRef.current = null;
+          }
+          setStatusText("You've arrived at your destination");
+          setTimeout(() => setIsRatingModalOpen(true), 2000);
+          return;
+        }
 
-    return () => {
-      // Cleanup order listener
-      if (orderListenerRef.current) {
-        orderListenerRef.current();
-        orderListenerRef.current = null;
-      }
+        // Start GPS listener when driver is assigned
+        if (newStatus === 'accepted' && data.driverId && !gpsListenerRef.current) {
+          gpsListenerRef.current = listenToDriverLocation(data.driverId, (driverLoc) => {
+            const currentStatus = rideStatus;
 
-      // Cleanup GPS listener
-      if (gpsListenerRef.current) {
-        gpsListenerRef.current();
-        gpsListenerRef.current = null;
-      }
-    };
-  }, [orderId, isFood, isService, hasShownArrivalAlert, driverInfo, rideStatus]);
+            if (currentStatus === 'accepted' || currentStatus === 'arrived') {
+              const pickupCoords = data.pickupLocation || { latitude: -26.2041, longitude: 28.0473 };
+              const etaMinutes = calculateETA(driverLoc, pickupCoords);
+
+              if (currentStatus === 'accepted') {
+                setStatusText(`Arriving in ${etaMinutes} min${etaMinutes !== 1 ? 's' : ''}`);
+              }
+            } else if (currentStatus === 'started') {
+              const destinationCoords = data.destinationLocation || { latitude: -26.195, longitude: 28.04 };
+              const etaMinutes = calculateETA(driverLoc, destinationCoords);
+              setStatusText(`On trip - ETA ${etaMinutes} min${etaMinutes !== 1 ? 's' : ''}`);
+            }
+          });
+        }
+      });
+
+      orderListenerRef.current = () => off(orderRef, 'value', unsubscribe);
+
+      return () => {
+        if (orderListenerRef.current) {
+          orderListenerRef.current();
+          orderListenerRef.current = null;
+        }
+        if (gpsListenerRef.current) {
+          gpsListenerRef.current();
+          gpsListenerRef.current = null;
+        }
+      };
+    }
+  }, [orderId, isFood, isService, isRide, useFirestore, hasShownArrivalAlert, driverInfo, rideStatus]);
 
   const handleMessageDriver = async () => {
     setIsMessagePanelOpen(true);
@@ -223,10 +326,21 @@ export const DriverComing: React.FC<DriverComingProps> = ({
 
   const handleConfirmCancel = async () => {
     try {
-      const rideIdToCancel = currentRide?.id || currentRideId;
+      const rideIdToCancel = orderId || currentRide?.id || currentRideId;
       if (!rideIdToCancel) return;
 
-      await firebaseService.updateRideStatus(rideIdToCancel, 'cancelled');
+      if (isRide && useFirestore) {
+        // Update Firestore ride status
+        const rideDocRef = doc(db, 'rides', rideIdToCancel);
+        await updateDoc(rideDocRef, {
+          status: 'cancelled',
+          cancelledAt: serverTimestamp()
+        });
+      } else {
+        // Update Realtime Database
+        await firebaseService.updateRideStatus(rideIdToCancel, 'cancelled');
+      }
+      
       setShowCancelConfirmation(false);
 
       navigate('/what-went-wrong', {
@@ -234,10 +348,10 @@ export const DriverComing: React.FC<DriverComingProps> = ({
           rideId: rideIdToCancel,
           userId: profile?.id || 'user123',
           userName: profile?.name || 'Unknown User',
-          destination,
-          pickup,
-          stops,
-          carType,
+          destination: finalDestination,
+          pickup: finalPickup,
+          stops: finalStops,
+          carType: finalCarType,
           price: finalPrice
         }
       });
@@ -249,7 +363,8 @@ export const DriverComing: React.FC<DriverComingProps> = ({
 
   const handleSubmitRating = async (rating: number, feedback: string) => {
     const activeOrderId = orderId || currentRideId;
-    const activeDriverId = (isService ? serviceRequestDetails?.driverId : (isFood ? foodOrderDetails?.driverId : currentRide?.driverId));
+    const activeDriverId = firestoreRideData?.driverId || 
+      (isService ? serviceRequestDetails?.driverId : (isFood ? foodOrderDetails?.driverId : currentRide?.driverId));
 
     if (!activeOrderId || !activeDriverId || !profile?.id) return;
 
@@ -258,15 +373,27 @@ export const DriverComing: React.FC<DriverComingProps> = ({
       await firebaseService.submitRating(activeDriverId, activeOrderId, rating, feedback, profile.id);
 
       // Update order with rating info
-      const collectionName = isService ? 'serviceRequests' : (isFood ? 'foodOrders' : 'rides');
-      const orderRef = ref(database, `${collectionName}/${activeOrderId}`);
-      await update(orderRef, {
-        rated: true,
-        rating: rating,
-        ratingFeedback: feedback,
-        ratedAt: serverTimestamp()
-      });
+      if (isRide && useFirestore) {
+        const rideDocRef = doc(db, 'rides', activeOrderId);
+        await updateDoc(rideDocRef, {
+          rated: true,
+          rating: rating,
+          ratingFeedback: feedback,
+          ratedAt: serverTimestamp()
+        });
+      } else {
+        const collectionName = isService ? 'serviceRequests' : (isFood ? 'foodOrders' : 'rides');
+        const orderRef = ref(database, `${collectionName}/${activeOrderId}`);
+        await update(orderRef, {
+          rated: true,
+          rating: rating,
+          ratingFeedback: feedback,
+          ratedAt: Date.now()
+        });
+      }
 
+      localStorage.removeItem('currentRideId');
+      localStorage.removeItem('currentOrderType');
       setIsRatingModalOpen(false);
       navigate('/');
     } catch (error) {
@@ -290,6 +417,20 @@ export const DriverComing: React.FC<DriverComingProps> = ({
   return (
     <div className="min-h-screen relative overflow-hidden">
       <MapBackground />
+
+      {/* Arrival Alert */}
+      <AnimatePresence>
+        {showArrivalAlert && (
+          <motion.div
+            className="fixed top-4 left-4 right-4 bg-green-600 text-white p-4 rounded-xl shadow-lg z-50"
+            initial={{ y: -100, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            exit={{ y: -100, opacity: 0 }}
+          >
+            <p className="font-semibold text-center">Your driver has arrived!</p>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <DraggablePanel initialHeight={500} maxHeight={680} minHeight={175}>
         <div className="space-y-6 pb-6">
@@ -410,7 +551,7 @@ export const DriverComing: React.FC<DriverComingProps> = ({
                       </div>
                       <div className="flex justify-between pt-2 border-t border-gray-200">
                         <span className="font-semibold text-gray-900">Total</span>
-                        <span className="text-lg font-bold text-gray-900">R {displayPrice}</span>
+                        <span className="text-lg font-bold text-gray-900">R {finalPrice}</span>
                       </div>
                     </div>
                   </motion.div>
@@ -423,11 +564,11 @@ export const DriverComing: React.FC<DriverComingProps> = ({
                     <div className="space-y-3">
                       <div className="flex items-center space-x-3">
                         <div className="w-3 h-3 bg-green-500 rounded-full"></div>
-                        <span className="flex-1 text-gray-700">{pickup}</span>
+                        <span className="flex-1 text-gray-700">{finalPickup}</span>
                         <Edit className="text-gray-400" size={16} />
                       </div>
 
-                      {stops.map((stop, index) => (
+                      {finalStops.map((stop: string, index: number) => (
                         <div key={index} className="flex items-center space-x-3 ml-6">
                           <div className="w-3 h-3 bg-blue-500 rounded-full"></div>
                           <span className="flex-1 text-gray-700">{stop}</span>
@@ -442,7 +583,7 @@ export const DriverComing: React.FC<DriverComingProps> = ({
 
                       <div className="flex items-center space-x-3">
                         <MapPin className="text-blue-600" size={12} />
-                        <span className="flex-1 text-gray-700">{destination}</span>
+                        <span className="flex-1 text-gray-700">{finalDestination}</span>
                         <Edit className="text-gray-400" size={16} />
                       </div>
                     </div>
@@ -456,7 +597,7 @@ export const DriverComing: React.FC<DriverComingProps> = ({
                           <CreditCard className="text-green-600" size={20} />
                           <div>
                             <p className="font-medium text-gray-900">Cash</p>
-                            <p className="text-sm text-gray-500">Fare • {carType}</p>
+                            <p className="text-sm text-gray-500">Fare - {finalCarType}</p>
                           </div>
                         </div>
                         <span className="font-bold text-gray-900">R {finalPrice}</span>
@@ -533,7 +674,7 @@ export const DriverComing: React.FC<DriverComingProps> = ({
         rideId={orderId || ''}
         currentUserId={profile?.id || 'user123'}
         currentUserName={profile?.name || 'Client'}
-        driverId={(isFood ? foodOrderDetails?.driverId : currentRide?.driverId) || 'driver123'}
+        driverId={firestoreRideData?.driverId || (isFood ? foodOrderDetails?.driverId : currentRide?.driverId) || 'driver123'}
         driverName={driverInfo.name}
         isRideActive
       />

@@ -1,17 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Edit, X, Plus, MapPin } from 'lucide-react';
-import { BottomNavigation } from '../components/BottomNavigation';
-import { DraggablePanel } from '../components/DraggablePanel';
-import { ScrollableSection } from '../components/ScrollableSection';
 import { MapBackground } from '../components/MapBackground';
 import { useFirebaseRide } from '../hooks/useFirebaseRide';
 import { useUserProfile } from '../hooks/useUserProfile';
-import { calculatePriceWithStops, getCarTypePrice } from '../utils/priceCalculation';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { firebaseService } from '../services/firebaseService';
-import { database } from '../config/firebase';
+import { database, db } from '../config/firebase';
 import { ref, onValue, off } from 'firebase/database';
+import { doc, onSnapshot } from 'firebase/firestore';
 
 interface WaitingForDriverProps {
   destination: string;
@@ -43,21 +38,25 @@ export const WaitingForDriver: React.FC<WaitingForDriverProps> = ({
   const { createRide, currentRide, isLoading } = useFirebaseRide(currentRideId);
   const { profile } = useUserProfile();
 
-  const { orderType = 'ride', requestId, orderData = {} } = location.state || {};
+  const { 
+    orderType = 'ride', 
+    requestId, 
+    orderData = {},
+    useFirestore = false // Flag to determine which DB to use
+  } = location.state || {};
+  
   const isFood = orderType === 'food';
   const isService = orderType === 'service';
-  const collectionName = isService ? 'serviceRequests' : (isFood ? 'foodOrders' : 'rides');
+  const isRide = orderType === 'ride';
   const orderId = requestId || currentRideId;
 
-  const finalDestination = isService ? orderData.destinationAddress : (isFood ? orderData.destinationAddress : destination);
-  const finalPickup = isService ? orderData.pickupAddress : (isFood ? orderData.pickupAddress : pickup);
-  const finalStops = isService ? (orderData.stops || []) : (isFood ? (orderData.stops || []) : stops);
-  const finalCarType = isService ? orderData.vehicleClass : (isFood ? orderData.deliveryMode?.label : carType);
-  const finalPrice = isService ? orderData.pricing?.basePrice : (isFood ? orderData.totalPrice : price);
+  const finalDestination = isService ? orderData.destinationAddress : (isFood ? orderData.destinationAddress : (orderData.destination || destination));
+  const finalPickup = isService ? orderData.pickupAddress : (isFood ? orderData.pickupAddress : (orderData.pickup || pickup));
+  const finalStops = isService ? (orderData.stops || []) : (isFood ? (orderData.stops || []) : (orderData.stops || stops));
+  const finalCarType = isService ? orderData.vehicleClass : (isFood ? orderData.deliveryMode?.label : (orderData.rideName || carType));
+  const finalPrice = isService ? orderData.pricing?.basePrice : (isFood ? orderData.totalPrice : (orderData.estimatedPrice || price));
 
-  const priceCalculation = !isFood && !isService ? calculatePriceWithStops(pickup, destination, stops) : null;
-  const displayPrice = isService || isFood ? finalPrice : (priceCalculation ? getCarTypePrice(priceCalculation.totalPrice, carType) : finalPrice);
-
+  // Progress timer for scanning animation
   useEffect(() => {
     if (!isScanning) return;
 
@@ -75,29 +74,65 @@ export const WaitingForDriver: React.FC<WaitingForDriverProps> = ({
     return () => clearInterval(timer);
   }, [isScanning]);
 
+  // Listen to ride/order status changes
   useEffect(() => {
     if (!orderId) return;
 
-    const orderRef = ref(database, `${collectionName}/${orderId}`);
+    // For ride orders, check if we should use Firestore
+    if (isRide && useFirestore) {
+      // Listen to Firestore rides collection
+      const rideDocRef = doc(db, 'rides', orderId);
+      
+      const unsubscribe = onSnapshot(rideDocRef, (snapshot) => {
+        if (snapshot.exists()) {
+          const data = snapshot.data();
+          
+          if (data.status === 'accepted') {
+            setIsScanning(false);
+            setTimeout(() => {
+              navigate('/driver-coming', {
+                state: {
+                  orderType: 'ride',
+                  requestId: orderId,
+                  useFirestore: true,
+                  orderData: {
+                    ...orderData,
+                    ...data,
+                    driverId: data.driverId,
+                    driverInfo: data.driverInfo
+                  }
+                }
+              });
+            }, 500);
+          }
+        }
+      });
 
-    const unsubscribe = onValue(orderRef, (snapshot) => {
-      const data = snapshot.val();
-      if (data && data.status === 'accepted') {
-        setIsScanning(false);
-        setTimeout(() => {
-          navigate('/driver-coming', {
-            state: {
-              orderType,
-              requestId: orderId,
-              orderData: data
-            }
-          });
-        }, 1000);
-      }
-    });
+      return () => unsubscribe();
+    } else {
+      // Use Realtime Database for other order types or legacy rides
+      const collectionName = isService ? 'serviceRequests' : (isFood ? 'foodOrders' : 'rides');
+      const orderRef = ref(database, `${collectionName}/${orderId}`);
 
-    return () => off(orderRef, 'value', unsubscribe);
-  }, [orderId, collectionName, orderType, navigate]);
+      const unsubscribe = onValue(orderRef, (snapshot) => {
+        const data = snapshot.val();
+        if (data && data.status === 'accepted') {
+          setIsScanning(false);
+          setTimeout(() => {
+            navigate('/driver-coming', {
+              state: {
+                orderType,
+                requestId: orderId,
+                orderData: data
+              }
+            });
+          }, 500);
+        }
+      });
+
+      return () => off(orderRef, 'value', unsubscribe);
+    }
+  }, [orderId, orderType, isRide, useFirestore, navigate, orderData]);
 
   const handleRequestAgain = async () => {
     if (isLoading) return;
@@ -106,25 +141,8 @@ export const WaitingForDriver: React.FC<WaitingForDriverProps> = ({
     setProgress(0);
     setIsScanning(true);
 
-    if (!isFood) {
-      const rideRequest = {
-        destination: finalDestination,
-        pickup: finalPickup,
-        stops: finalStops || [],
-        carType: finalCarType,
-        price: displayPrice,
-        status: 'pending' as const,
-        userId: profile?.id || 'user123',
-        userName: profile?.name || 'Unknown User',
-      };
-
-      try {
-        const rideId = await createRide(rideRequest);
-      } catch (error) {
-        console.error('Failed to request again:', error);
-        setShowNoDriverPopup(true);
-      }
-    }
+    // For non-food orders, we could create a new ride request
+    // For now, just restart the scanning animation
   };
 
   const handleCancel = () => {
@@ -141,6 +159,7 @@ export const WaitingForDriver: React.FC<WaitingForDriverProps> = ({
         localStorage.removeItem('currentOrderType');
       } else {
         localStorage.removeItem('currentRideId');
+        localStorage.removeItem('currentOrderType');
       }
 
       setShowCancelConfirmation(false);
@@ -205,7 +224,7 @@ export const WaitingForDriver: React.FC<WaitingForDriverProps> = ({
               <div className="mt-2">
                 <p className="text-sm text-gray-600">via {finalStops.length} stop{finalStops.length > 1 ? 's' : ''}</p>
                 <div className="text-xs text-gray-500 mt-1">
-                  {finalStops.map((stop, index) => (
+                  {finalStops.map((stop: string, index: number) => (
                     <span key={index}>
                       {stop}{index < finalStops.length - 1 ? ' → ' : ''}
                     </span>
@@ -215,7 +234,7 @@ export const WaitingForDriver: React.FC<WaitingForDriverProps> = ({
             )}
             <div className="flex items-center justify-center space-x-4 mt-4">
               <span className="text-lg font-medium text-gray-700">{finalCarType}</span>
-              <span className="text-2xl font-bold text-gray-900">R {displayPrice}</span>
+              <span className="text-2xl font-bold text-gray-900">R {finalPrice}</span>
             </div>
           </div>
 
@@ -241,7 +260,7 @@ export const WaitingForDriver: React.FC<WaitingForDriverProps> = ({
 
                   <h3 className="text-2xl font-bold text-gray-900 mb-4 text-center">No drivers available</h3>
                   <p className="text-gray-600 text-center mb-8">
-                    We couldn't find a driver in your area. Try again in a few moments.
+                    We couldn&apos;t find a driver in your area. Try again in a few moments.
                   </p>
 
                   <motion.button

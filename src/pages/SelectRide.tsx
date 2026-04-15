@@ -4,10 +4,19 @@ import { motion, AnimatePresence, PanInfo, useMotionValue, useSpring, useTransfo
 import { X, Plus, Calendar, Users, User, Briefcase, ChevronDown } from 'lucide-react';
 import { MapBackground } from '../components/MapBackground';
 import { PromoDetailsPanel } from '../components/PromoDetailsPanel';
-import { carTypes } from '../data/mockData';
-import { calculatePriceWithStops, getCarTypePrice } from '../utils/priceCalculation';
 import { useRideContext } from '../contexts/RideContext';
+import { useRideOptions } from '../hooks/useRideOptions';
+import { RideOption } from '../services/rideService';
 import { getFleetOptions, FleetVehicle } from '../services/fleetService';
+
+// Car icons mapping - use public folder images with emoji fallbacks
+const RIDE_ICONS: Record<string, { image?: string; emoji: string; color: string }> = {
+  'ride_economy': { image: '/cars/economy.png', emoji: '🚙', color: 'bg-green-100' },
+  'ride_comfort': { image: '/cars/comfort.png', emoji: '🚗', color: 'bg-gray-100' },
+  'ride_xl': { image: '/cars/xl.png', emoji: '🚐', color: 'bg-blue-100' },
+  'ride_women': { image: '/cars/economy.png', emoji: '🚗', color: 'bg-pink-100' },
+  'aletwende': { image: '/cars/economy.png', emoji: '🚕', color: 'bg-yellow-100' },
+};
 
 interface SelectRideProps {
   destination: string;
@@ -32,32 +41,70 @@ export const SelectRide: React.FC<SelectRideProps> = ({
 }) => {
   const navigate = useNavigate();
   const location = useLocation();
-  const { isRideActive, rideStatus } = useRideContext();
+  const { isRideActive } = useRideContext();
   const panelRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [isDragging, setIsDragging] = useState(false);
 
   // Read navigation state to determine service type
-  const { serviceType = 'ride', extraOption } = location.state || {};
+  const { 
+    serviceType = 'ride', 
+    extraOption,
+    pickupCoords,
+    destinationCoords 
+  } = location.state || {};
 
-  // Calculate base price for the trip
-  const priceCalculation = calculatePriceWithStops(pickup, destination, stops);
+  // User's GPS location state
+  const [userLocation, setUserLocation] = useState<{ lat: number; lng: number } | null>(null);
 
-  // State for fleet vehicles
+  // Get user's GPS location on mount
+  useEffect(() => {
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          setUserLocation({
+            lat: position.coords.latitude,
+            lng: position.coords.longitude
+          });
+        },
+        (error) => {
+          console.error('Error getting user location:', error);
+          // Default to Johannesburg coordinates
+          setUserLocation({ lat: -26.2041, lng: 28.0473 });
+        },
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
+      );
+    } else {
+      // Default to Johannesburg coordinates
+      setUserLocation({ lat: -26.2041, lng: 28.0473 });
+    }
+  }, []);
+
+  // Promo discount (30%)
+  const promoDiscount = 30;
+
+  // Use the real-time ride options hook for "ride" service type
+  const { 
+    rideOptions, 
+    isLoading: isLoadingRides, 
+    error: rideError 
+  } = useRideOptions({
+    pickupLat: pickupCoords?.lat || userLocation?.lat || null,
+    pickupLng: pickupCoords?.lng || userLocation?.lng || null,
+    destinationLat: destinationCoords?.lat || null,
+    destinationLng: destinationCoords?.lng || null,
+    discountPercent: promoDiscount,
+    enabled: serviceType === 'ride'
+  });
+
+  // State for fleet vehicles (non-ride services)
   const [fleetVehicles, setFleetVehicles] = useState<FleetVehicle[]>([]);
   const [isLoadingFleet, setIsLoadingFleet] = useState(false);
 
-  // Create car types with calculated prices (for regular rides)
-  const carsWithPrices = carTypes.map(car => ({
-    ...car,
-    price: getCarTypePrice(priceCalculation.totalPrice, car.name),
-    originalPrice: Math.round(getCarTypePrice(priceCalculation.totalPrice, car.name) * 1.25)
-  }));
-
-  // Determine which vehicles to display
-  const displayVehicles = serviceType === 'ride' ? carsWithPrices : fleetVehicles;
-
-  const [selectedCar, setSelectedCar] = useState<any>(displayVehicles[0] || carsWithPrices[0]);
+  // Selected ride option
+  const [selectedRide, setSelectedRide] = useState<RideOption | null>(null);
+  const [selectedFleetVehicle, setSelectedFleetVehicle] = useState<FleetVehicle | null>(null);
+  
   const [showPromoDetails, setShowPromoDetails] = useState(false);
   const [selectedFilter, setSelectedFilter] = useState<FilterTab>('recommended');
   const [profileToggle, setProfileToggle] = useState<'personal' | 'business'>('personal');
@@ -74,12 +121,21 @@ export const SelectRide: React.FC<SelectRideProps> = ({
   const [isExpanded, setIsExpanded] = useState(false);
 
   // Track expansion state from spring value
-  React.useEffect(() => {
+  useEffect(() => {
     const unsubscribe = springPanelVh.on('change', (latest) => {
       setIsExpanded(latest > EXPAND_THRESHOLD_VH);
     });
     return unsubscribe;
   }, [springPanelVh]);
+
+  // Select first available ride option when options load
+  useEffect(() => {
+    if (serviceType === 'ride' && rideOptions.length > 0 && !selectedRide) {
+      // Select first available option
+      const firstAvailable = rideOptions.find(opt => opt.isAvailable) || rideOptions[0];
+      setSelectedRide(firstAvailable);
+    }
+  }, [rideOptions, selectedRide, serviceType]);
 
   // Load fleet options for logistics services
   useEffect(() => {
@@ -90,7 +146,7 @@ export const SelectRide: React.FC<SelectRideProps> = ({
           const vehicles = await getFleetOptions(serviceType as any, extraOption);
           setFleetVehicles(vehicles);
           if (vehicles.length > 0) {
-            setSelectedCar(vehicles[0]);
+            setSelectedFleetVehicle(vehicles[0]);
           }
         } catch (error) {
           console.error('Failed to load fleet:', error);
@@ -104,7 +160,7 @@ export const SelectRide: React.FC<SelectRideProps> = ({
   }, [serviceType, extraOption]);
 
   const promo = {
-    discount: 30,
+    discount: promoDiscount,
     ridesLeft: 5,
     maxPerRide: 80,
     expiryDate: 'December 29, 2025',
@@ -131,7 +187,6 @@ export const SelectRide: React.FC<SelectRideProps> = ({
     if (Math.abs(velocity) > 600) {
       rawPanelVh.set(velocity > 0 ? PANEL_MAX_VH : PANEL_MIN_VH);
     } else {
-      // Snap to nearest position
       const currentVh = rawPanelVh.get();
       if (currentVh > EXPAND_THRESHOLD_VH) {
         rawPanelVh.set(PANEL_MAX_VH);
@@ -141,8 +196,33 @@ export const SelectRide: React.FC<SelectRideProps> = ({
     }
   }, [rawPanelVh]);
 
-  const getSortedCars = () => {
-    let sorted = [...displayVehicles];
+  // Sort ride options based on filter
+  const getSortedRideOptions = (): RideOption[] => {
+    let sorted = [...rideOptions];
+
+    if (selectedFilter === 'faster') {
+      sorted.sort((a, b) => {
+        // Available rides first
+        if (a.isAvailable && !b.isAvailable) return -1;
+        if (!a.isAvailable && b.isAvailable) return 1;
+        return a.etaMinutes - b.etaMinutes;
+      });
+    } else if (selectedFilter === 'cheaper') {
+      sorted.sort((a, b) => {
+        if (a.isAvailable && !b.isAvailable) return -1;
+        if (!a.isAvailable && b.isAvailable) return 1;
+        return a.estimatedPrice - b.estimatedPrice;
+      });
+    }
+
+    return sorted;
+  };
+
+  const sortedRideOptions = getSortedRideOptions();
+
+  // Sort fleet vehicles
+  const getSortedFleetVehicles = (): FleetVehicle[] => {
+    let sorted = [...fleetVehicles];
 
     if (selectedFilter === 'faster') {
       sorted.sort((a, b) => {
@@ -157,12 +237,62 @@ export const SelectRide: React.FC<SelectRideProps> = ({
     return sorted;
   };
 
-  const sortedCars = getSortedCars();
+  const sortedFleetVehicles = getSortedFleetVehicles();
 
   const getAddressDisplay = () => {
     const stopsText = stops.length > 0 ? ` +${stops.length} stop${stops.length > 1 ? 's' : ''}` : '';
     return `${pickup} → ${destination}${stopsText}`;
   };
+
+  // Handle ride selection and navigation to confirm
+  const handleSelectRide = () => {
+    if (isRideActive) {
+      alert('You already have an active ride.');
+      return;
+    }
+
+    if (serviceType === 'ride' && selectedRide) {
+      // Navigate to confirm order with all ride data
+      navigate('/confirm-order', {
+        state: {
+          orderType: 'ride',
+          rideData: {
+            pricingId: selectedRide.pricingId,
+            name: selectedRide.displayName,
+            estimatedPrice: selectedRide.estimatedPrice,
+            originalPrice: selectedRide.originalPrice,
+            eta: selectedRide.eta,
+            vehicleCategory: selectedRide.vehicleCategory,
+            seats: selectedRide.seats
+          },
+          pickupAddress: pickup,
+          destinationAddress: destination,
+          stops,
+          pickupCoords,
+          destinationCoords
+        }
+      });
+    } else if (selectedFleetVehicle) {
+      navigate('/confirm-order', {
+        state: {
+          serviceType,
+          vehicle: selectedFleetVehicle,
+          extraSelection: extraOption,
+          pickupAddress: pickup,
+          destinationAddress: destination,
+          stops
+        }
+      });
+    }
+  };
+
+  // Get icon config for a ride option
+  const getRideIconConfig = (pricingId: string) => {
+    return RIDE_ICONS[pricingId] || RIDE_ICONS['ride_economy'];
+  };
+
+  const isLoading = serviceType === 'ride' ? isLoadingRides : isLoadingFleet;
+  const hasOptions = serviceType === 'ride' ? rideOptions.length > 0 : fleetVehicles.length > 0;
 
   return (
     <div className="fixed inset-0 bg-gray-100 overflow-hidden">
@@ -175,7 +305,6 @@ export const SelectRide: React.FC<SelectRideProps> = ({
               </pattern>
             </defs>
             <rect width="100%" height="100%" fill="url(#map-grid)" />
-
             <path
               d="M 200 400 Q 250 300 300 200"
               stroke="#4f46e5"
@@ -199,7 +328,9 @@ export const SelectRide: React.FC<SelectRideProps> = ({
           animate={{ scale: 1 }}
           transition={{ delay: 0.3, type: 'spring' }}
         >
-          Arrive by 20:38
+          {selectedRide?.isAvailable 
+            ? `Arrive in ~${selectedRide.etaMinutes + 15} min`
+            : 'Searching for drivers...'}
         </motion.div>
       </div>
 
@@ -331,7 +462,6 @@ export const SelectRide: React.FC<SelectRideProps> = ({
                   transition={{ delay: 0.1, type: 'spring', damping: 20, stiffness: 300 }}
                   whileTap={{ scale: 0.95 }}
                 >
-                  <span>⚡</span>
                   Faster
                 </motion.button>
                 <motion.button
@@ -347,7 +477,6 @@ export const SelectRide: React.FC<SelectRideProps> = ({
                   transition={{ delay: 0.15, type: 'spring', damping: 20, stiffness: 300 }}
                   whileTap={{ scale: 0.95 }}
                 >
-                  <span>💰</span>
                   Cheaper
                 </motion.button>
               </div>
@@ -363,25 +492,83 @@ export const SelectRide: React.FC<SelectRideProps> = ({
             touchAction: isDragging ? 'none' : 'pan-y'
           }}
         >
-          {isLoadingFleet ? (
+          {isLoading ? (
             <div className="flex items-center justify-center py-8">
               <div className="text-center">
                 <div className="w-8 h-8 border-2 border-green-500 border-t-transparent rounded-full animate-spin mx-auto mb-2"></div>
-                <p className="text-gray-600 text-sm">Loading vehicles...</p>
+                <p className="text-gray-600 text-sm">Loading ride options...</p>
               </div>
             </div>
-          ) : sortedCars.length === 0 ? (
+          ) : rideError ? (
+            <div className="flex items-center justify-center py-8">
+              <p className="text-red-600">{rideError}</p>
+            </div>
+          ) : !hasOptions ? (
             <div className="flex items-center justify-center py-8">
               <p className="text-gray-600">No vehicles available</p>
             </div>
-          ) : (
+          ) : serviceType === 'ride' ? (
+            // Render ride options from Firestore
             <div className="space-y-3 mb-6">
-              {sortedCars.map((car, index) => (
+              {sortedRideOptions.map((option, index) => (
                 <motion.button
-                  key={car.id}
-                  onClick={() => setSelectedCar(car)}
+                  key={option.id}
+                  onClick={() => option.isAvailable && setSelectedRide(option)}
+                  disabled={!option.isAvailable}
                   className={`w-full p-4 rounded-2xl border-2 transition-all ${
-                    selectedCar?.id === car.id
+                    !option.isAvailable 
+                      ? 'border-gray-200 bg-gray-50 opacity-60 cursor-not-allowed'
+                      : selectedRide?.id === option.id
+                        ? 'border-green-600 bg-green-50'
+                        : 'border-gray-200 bg-white hover:border-gray-300'
+                  }`}
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ delay: index * 0.05 }}
+                  whileTap={{ scale: option.isAvailable ? 0.98 : 1 }}
+                >
+                  <div className="flex items-center space-x-4">
+                    <div className={`w-12 h-12 flex items-center justify-center rounded-xl ${getRideIconConfig(option.pricingId).color}`}>
+                      <span className="text-2xl">{getRideIconConfig(option.pricingId).emoji}</span>
+                    </div>
+                    <div className="flex-1 text-left">
+                      <div className="flex items-center justify-between">
+                        <h3 className="font-bold text-gray-900">{option.displayName}</h3>
+                        <div className="text-right">
+                          <p className="font-bold text-gray-900">R {option.estimatedPrice}</p>
+                          {option.originalPrice !== option.estimatedPrice && (
+                            <p className="text-sm text-gray-500 line-through">R {option.originalPrice}</p>
+                          )}
+                        </div>
+                      </div>
+                      <div className="flex items-center space-x-4 mt-1">
+                        <span className={`text-sm ${option.isAvailable ? 'text-gray-600' : 'text-orange-600'}`}>
+                          {option.eta}
+                        </span>
+                        <div className="flex items-center space-x-1">
+                          <Users size={14} className="text-gray-500" />
+                          <span className="text-sm text-gray-600">{option.seats}</span>
+                        </div>
+                      </div>
+                      {!option.isAvailable && (
+                        <span className="inline-block mt-2 px-2 py-1 rounded-full text-xs font-bold bg-orange-100 text-orange-800">
+                          NO DRIVERS
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </motion.button>
+              ))}
+            </div>
+          ) : (
+            // Render fleet vehicles for other services
+            <div className="space-y-3 mb-6">
+              {sortedFleetVehicles.map((vehicle, index) => (
+                <motion.button
+                  key={vehicle.id}
+                  onClick={() => setSelectedFleetVehicle(vehicle)}
+                  className={`w-full p-4 rounded-2xl border-2 transition-all ${
+                    selectedFleetVehicle?.id === vehicle.id
                       ? 'border-green-600 bg-green-50'
                       : 'border-gray-200 bg-white hover:border-gray-300'
                   }`}
@@ -391,43 +578,27 @@ export const SelectRide: React.FC<SelectRideProps> = ({
                   whileTap={{ scale: 0.98 }}
                 >
                   <div className="flex items-center space-x-4">
-                    <div className="text-2xl">{car.icon}</div>
+                    <div className="text-2xl">{vehicle.icon}</div>
                     <div className="flex-1 text-left">
                       <div className="flex items-center justify-between">
-                        <h3 className="font-bold text-gray-900">{car.name}</h3>
+                        <h3 className="font-bold text-gray-900">{vehicle.name}</h3>
                         <div className="text-right">
-                          <p className="font-bold text-gray-900">R {car.price}</p>
-                          {car.originalPrice && (
-                            <p className="text-sm text-gray-500 line-through">R {car.originalPrice}</p>
-                          )}
+                          <p className="font-bold text-gray-900">R {vehicle.price}</p>
                         </div>
                       </div>
                       <div className="flex items-center space-x-4 mt-1">
-                        <span className="text-sm text-gray-600">{car.eta}</span>
-                        {typeof car.capacity === 'number' && (
+                        <span className="text-sm text-gray-600">{vehicle.eta}</span>
+                        {typeof vehicle.capacity === 'number' && (
                           <div className="flex items-center space-x-1">
                             <Users size={14} className="text-gray-500" />
-                            <span className="text-sm text-gray-600">{car.capacity}</span>
+                            <span className="text-sm text-gray-600">{vehicle.capacity}</span>
                           </div>
                         )}
-                        {typeof car.capacity === 'string' && (
-                          <span className="text-sm text-gray-600">{car.capacity}</span>
+                        {typeof vehicle.capacity === 'string' && (
+                          <span className="text-sm text-gray-600">{vehicle.capacity}</span>
                         )}
-                        <span className="text-sm text-gray-600">{car.description}</span>
+                        <span className="text-sm text-gray-600">{vehicle.description}</span>
                       </div>
-                      {car.badge && (
-                        <span
-                          className={`inline-block mt-2 px-2 py-1 rounded-full text-xs font-bold ${
-                            car.badge === 'FASTER' || car.badge === 'RECOMMENDED'
-                              ? 'bg-green-100 text-green-800'
-                              : car.badge === 'CHEAPER'
-                              ? 'bg-blue-100 text-blue-800'
-                              : 'bg-purple-100 text-purple-800'
-                          }`}
-                        >
-                          {car.badge}
-                        </span>
-                      )}
                     </div>
                   </div>
                 </motion.button>
@@ -482,36 +653,23 @@ export const SelectRide: React.FC<SelectRideProps> = ({
           </div>
 
           <motion.button
-            onClick={() => {
-              if (isRideActive) {
-                alert('You already have an active ride.');
-                return;
-              }
-
-              if (serviceType === 'ride') {
-                onSelectRide(selectedCar.name, selectedCar.price);
-              } else {
-                navigate('/confirm-order', {
-                  state: {
-                    serviceType,
-                    vehicle: selectedCar,
-                    extraSelection: extraOption,
-                    pickupAddress: pickup,
-                    destinationAddress: destination,
-                    stops
-                  }
-                });
-              }
-            }}
-            disabled={isRideActive}
+            onClick={handleSelectRide}
+            disabled={isRideActive || (serviceType === 'ride' ? !selectedRide?.isAvailable : !selectedFleetVehicle)}
             className={`w-full py-3 rounded-2xl font-bold text-base transition-colors shadow-lg ${
-              isRideActive
+              isRideActive || (serviceType === 'ride' ? !selectedRide?.isAvailable : !selectedFleetVehicle)
                 ? 'bg-gray-400 text-gray-200 cursor-not-allowed'
                 : 'bg-green-600 text-white hover:bg-green-700'
             }`}
-            whileTap={{ scale: isRideActive ? 1 : 0.98 }}
+            whileTap={{ scale: (isRideActive || !selectedRide?.isAvailable) ? 1 : 0.98 }}
           >
-            {isRideActive ? 'Ride Active' : `Select ${selectedCar.name}`}
+            {isRideActive 
+              ? 'Ride Active' 
+              : serviceType === 'ride'
+                ? selectedRide?.isAvailable 
+                  ? `Select ${selectedRide?.displayName}`
+                  : 'No drivers available'
+                : `Select ${selectedFleetVehicle?.name || ''}`
+            }
           </motion.button>
           {isRideActive && (
             <p className="text-gray-500 text-center text-sm mt-2">
