@@ -37,7 +37,7 @@ export interface PricingConfig {
 export interface VehicleServiceRule {
   id: string;
   vehicleRef: string;
-  pricingTypes: string[];
+  allowedPricingTypes: string[]; // CORRECT field name from Firestore
   services: string[];
 }
 
@@ -120,14 +120,38 @@ class RideService {
       const q = query(rulesRef, where('services', 'array-contains', 'ride'));
       const snapshot = await getDocs(q);
       
-      this.vehicleRulesCache = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      } as VehicleServiceRule));
+      console.log('[v0] Raw vehicle_service_rules snapshot:', snapshot.docs.length, 'docs');
       
+      this.vehicleRulesCache = snapshot.docs
+        .map(doc => {
+          const data = doc.data();
+          console.log('[v0] Rule doc:', doc.id, data);
+          
+          // Safe data access - ensure required fields exist
+          const allowedPricingTypes = data.allowedPricingTypes;
+          if (!allowedPricingTypes || !Array.isArray(allowedPricingTypes)) {
+            console.warn('[v0] Skipping rule - missing or invalid allowedPricingTypes:', doc.id);
+            return null;
+          }
+          
+          if (!data.vehicleRef) {
+            console.warn('[v0] Skipping rule - missing vehicleRef:', doc.id);
+            return null;
+          }
+          
+          return {
+            id: doc.id,
+            vehicleRef: data.vehicleRef,
+            allowedPricingTypes: allowedPricingTypes,
+            services: data.services || []
+          } as VehicleServiceRule;
+        })
+        .filter((rule): rule is VehicleServiceRule => rule !== null);
+      
+      console.log('[v0] Processed vehicle rules:', this.vehicleRulesCache);
       return this.vehicleRulesCache;
     } catch (error) {
-      console.error('Error fetching vehicle service rules:', error);
+      console.error('[v0] Error fetching vehicle service rules:', error);
       return [];
     }
   }
@@ -162,6 +186,7 @@ class RideService {
 
   /**
    * Fetch pricing config by ID
+   * Only returns pricing if active === true
    */
   async fetchPricingConfig(pricingId: string): Promise<PricingConfig | null> {
     // Check cache first
@@ -173,17 +198,32 @@ class RideService {
       const pricingRef = doc(db, 'pricing', pricingId);
       const snapshot = await getDoc(pricingRef);
       
+      console.log('[v0] Pricing fetch for', pricingId, ':', snapshot.exists() ? snapshot.data() : 'NOT FOUND');
+      
       if (snapshot.exists()) {
+        const data = snapshot.data();
+        
+        // Only include active pricing
+        if (data.active === false) {
+          console.log('[v0] Skipping inactive pricing:', pricingId);
+          return null;
+        }
+        
         const pricing: PricingConfig = {
           id: snapshot.id,
-          ...snapshot.data() as Omit<PricingConfig, 'id'>
+          name: data.name || pricingId,
+          baseFare: data.baseFare ?? 0,
+          pricePerKm: data.pricePerKm ?? 0,
+          pricePerMinute: data.pricePerMinute ?? 0,
+          minimumFare: data.minimumFare ?? 0,
+          vehicleCategory: data.vehicleCategory
         };
         this.pricingCache.set(pricingId, pricing);
         return pricing;
       }
       return null;
     } catch (error) {
-      console.error('Error fetching pricing config:', error);
+      console.error('[v0] Error fetching pricing config:', pricingId, error);
       return null;
     }
   }
@@ -201,68 +241,96 @@ class RideService {
 
   /**
    * Start listening to online drivers (Realtime DB)
+   * Fail-safe: returns empty map if collection doesn't exist
    */
   startDriversListener(callback: (drivers: Map<string, OnlineDriver>) => void): () => void {
-    const driversRef = ref(database, 'drivers_online');
-    
-    const unsubscribe = onValue(driversRef, (snapshot) => {
-      const data = snapshot.val();
-      this.onlineDriversCache.clear();
+    try {
+      const driversRef = ref(database, 'drivers_online');
       
-      if (data) {
-        Object.entries(data).forEach(([driverId, driverData]) => {
-          const driver = driverData as any;
-          if (driver.isOnline === true && driver.isBusy === false) {
-            this.onlineDriversCache.set(driverId, {
-              driverId,
-              vehicleCategory: driver.vehicleCategory || '',
-              isOnline: driver.isOnline,
-              isBusy: driver.isBusy
-            });
-          }
-        });
-      }
-      
-      callback(this.onlineDriversCache);
-    });
+      const unsubscribe = onValue(driversRef, (snapshot) => {
+        const data = snapshot.val();
+        this.onlineDriversCache.clear();
+        
+        console.log('[v0] drivers_online data:', data ? Object.keys(data).length + ' drivers' : 'empty/null');
+        
+        if (data) {
+          Object.entries(data).forEach(([driverId, driverData]) => {
+            const driver = driverData as any;
+            if (driver && driver.isOnline === true && driver.isBusy === false) {
+              this.onlineDriversCache.set(driverId, {
+                driverId,
+                vehicleCategory: driver.vehicleCategory || '',
+                isOnline: driver.isOnline,
+                isBusy: driver.isBusy
+              });
+            }
+          });
+        }
+        
+        console.log('[v0] Available drivers:', this.onlineDriversCache.size);
+        callback(this.onlineDriversCache);
+      }, (error) => {
+        console.error('[v0] Error listening to drivers_online:', error);
+        // Return empty on error - don't crash
+        callback(new Map());
+      });
 
-    this.driversListener = () => off(driversRef, 'value', unsubscribe);
-    return this.driversListener;
+      this.driversListener = () => off(driversRef, 'value', unsubscribe);
+      return this.driversListener;
+    } catch (error) {
+      console.error('[v0] Failed to set up drivers listener:', error);
+      // Return a no-op cleanup function
+      return () => {};
+    }
   }
 
   /**
    * Start listening to driver locations (Realtime DB)
+   * Fail-safe: returns empty map if collection doesn't exist
    */
   startLocationsListener(callback: (locations: Map<string, { lat: number; lng: number }>) => void): () => void {
-    const locationsRef = ref(database, 'driver_locations');
-    
-    const unsubscribe = onValue(locationsRef, (snapshot) => {
-      const data = snapshot.val();
-      this.driverLocationsCache.clear();
+    try {
+      const locationsRef = ref(database, 'driver_locations');
       
-      if (data) {
-        Object.entries(data).forEach(([driverId, locationData]) => {
-          const loc = locationData as any;
-          // Handle GeoFire format: { l: [lat, lng], g: geohash }
-          if (loc.l && Array.isArray(loc.l) && loc.l.length >= 2) {
-            this.driverLocationsCache.set(driverId, {
-              lat: loc.l[0],
-              lng: loc.l[1]
-            });
-          } else if (loc.lat !== undefined && loc.lng !== undefined) {
-            this.driverLocationsCache.set(driverId, {
-              lat: loc.lat,
-              lng: loc.lng
-            });
-          }
-        });
-      }
-      
-      callback(this.driverLocationsCache);
-    });
+      const unsubscribe = onValue(locationsRef, (snapshot) => {
+        const data = snapshot.val();
+        this.driverLocationsCache.clear();
+        
+        console.log('[v0] driver_locations data:', data ? Object.keys(data).length + ' locations' : 'empty/null');
+        
+        if (data) {
+          Object.entries(data).forEach(([driverId, locationData]) => {
+            const loc = locationData as any;
+            // Handle GeoFire format: { l: [lat, lng], g: geohash }
+            if (loc && loc.l && Array.isArray(loc.l) && loc.l.length >= 2) {
+              this.driverLocationsCache.set(driverId, {
+                lat: loc.l[0],
+                lng: loc.l[1]
+              });
+            } else if (loc && loc.lat !== undefined && loc.lng !== undefined) {
+              this.driverLocationsCache.set(driverId, {
+                lat: loc.lat,
+                lng: loc.lng
+              });
+            }
+          });
+        }
+        
+        console.log('[v0] Driver locations cached:', this.driverLocationsCache.size);
+        callback(this.driverLocationsCache);
+      }, (error) => {
+        console.error('[v0] Error listening to driver_locations:', error);
+        // Return empty on error - don't crash
+        callback(new Map());
+      });
 
-    this.locationsListener = () => off(locationsRef, 'value', unsubscribe);
-    return this.locationsListener;
+      this.locationsListener = () => off(locationsRef, 'value', unsubscribe);
+      return this.locationsListener;
+    } catch (error) {
+      console.error('[v0] Failed to set up locations listener:', error);
+      // Return a no-op cleanup function
+      return () => {};
+    }
   }
 
   /**
